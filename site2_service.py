@@ -9,7 +9,6 @@ import subprocess
 import traceback
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from zoneinfo import ZoneInfo
@@ -39,7 +38,6 @@ _SERVICE_TASK: asyncio.Task | None = None
 _SERVICE_LOCK = asyncio.Lock()
 
 
-@lru_cache()
 def _dotenv_map() -> Dict[str, str]:
     env_path = find_env_file()
     if not env_path:
@@ -49,10 +47,11 @@ def _dotenv_map() -> Dict[str, str]:
 
 
 def _env_raw(name: str) -> str | None:
-    value = os.getenv(name)
+    # Prefer .env values so runtime settings are not overridden by stale process env.
+    value = _dotenv_map().get(name)
     if value is not None:
         return value
-    return _dotenv_map().get(name)
+    return os.getenv(name)
 
 
 def _env_bool(name: str, default: bool) -> bool:
