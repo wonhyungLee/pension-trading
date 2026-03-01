@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import math
 import os
+import secrets
 import sqlite3
 import subprocess
 import traceback
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from dotenv import dotenv_values
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse, ORJSONResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse, ORJSONResponse, FileResponse
+from pydantic import BaseModel
 
 from exchange import get_bot
 from exchange.model.schemas import find_env_file
@@ -30,6 +33,11 @@ OUT_DIR = BASE_DIR / "out"
 WEIGHTS_CSV_PATH = OUT_DIR / "best_target_weights_long.csv"
 BEST_CONFIG_PATH = OUT_DIR / "best_config.json"
 SITE2_DB_PATH = BASE_DIR / "site2.db"
+SITE2_FRONTEND_DIST_DIR = BASE_DIR / "site2" / "frontend" / "dist"
+SITE2_FRONTEND_ASSETS_DIR = SITE2_FRONTEND_DIST_DIR / "assets"
+
+SESSION_TTL_HOURS = 12
+ACTIVE_TOKENS: Dict[str, datetime] = {}
 
 TARGET_ACCOUNTS = [5, 8]
 
@@ -47,7 +55,8 @@ def _dotenv_map() -> Dict[str, str]:
 
 
 def _env_raw(name: str) -> str | None:
-    # Prefer .env values so runtime settings are not overridden by stale process env.
+    # Prefer .env values so SITE2 비중 변경이 즉시 반영되고,
+    # 이전 프로세스 환경값(os.environ)에 덮여쓰이지 않도록 한다.
     value = _dotenv_map().get(name)
     if value is not None:
         return value
@@ -68,7 +77,7 @@ def _get_sync_interval_sec() -> int:
 
 def _get_trade_trigger() -> Tuple[int, int]:
     hour = int(_env_raw("SITE2_TRADE_HOUR") or "9")
-    minute = int(_env_raw("SITE2_TRADE_MINUTE") or "5")
+    minute = int(_env_raw("SITE2_TRADE_MINUTE") or "0")
     return max(0, min(hour, 23)), max(0, min(minute, 59))
 
 
@@ -99,6 +108,70 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
+
+
+def _get_sleeve_weight_targets() -> Tuple[float, float]:
+    bond_weight = _safe_float(_env_raw("SITE2_BOND_WEIGHT"), 0.25)
+    bond_weight = min(max(bond_weight, 0.0), 1.0)
+
+    risk_weight = _safe_float(_env_raw("SITE2_RISK_WEIGHT"), 0.70)
+    risk_weight = min(max(risk_weight, 0.0), 1.0)
+
+    total = risk_weight + bond_weight
+    if total <= 0:
+        return 0.70, 0.25
+    if total > 1.0:
+        return risk_weight / total, bond_weight / total
+    return risk_weight, bond_weight
+
+
+def _apply_sleeve_targets(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "sleeve" not in df.columns:
+        return df
+
+    risk_target, bond_target = _get_sleeve_weight_targets()
+    out = df.copy()
+    out["sleeve"] = out["sleeve"].astype(str)
+
+    for _, day_rows in out.groupby("date", sort=False):
+        day_idx = day_rows.index
+        sleeve_norm = day_rows["sleeve"].str.upper()
+
+        risk_idx = day_rows[sleeve_norm == "RISK"].index
+        bond_idx = day_rows[sleeve_norm == "BOND"].index
+        other_idx = day_rows[(sleeve_norm != "RISK") & (sleeve_norm != "BOND")].index
+
+        if len(risk_idx) > 0 and len(bond_idx) > 0:
+            risk_alloc = risk_target
+            bond_alloc = bond_target
+        elif len(risk_idx) > 0:
+            risk_alloc = 1.0
+            bond_alloc = 0.0
+        elif len(bond_idx) > 0:
+            risk_alloc = 0.0
+            bond_alloc = 1.0
+        else:
+            total = float(out.loc[day_idx, "weight"].sum())
+            if total > 0:
+                out.loc[day_idx, "weight"] = out.loc[day_idx, "weight"] / total
+            continue
+
+        risk_sum = float(out.loc[risk_idx, "weight"].sum()) if len(risk_idx) > 0 else 0.0
+        if risk_sum > 0:
+            out.loc[risk_idx, "weight"] = out.loc[risk_idx, "weight"] * (risk_alloc / risk_sum)
+        elif len(risk_idx) > 0:
+            out.loc[risk_idx, "weight"] = risk_alloc / len(risk_idx)
+
+        bond_sum = float(out.loc[bond_idx, "weight"].sum()) if len(bond_idx) > 0 else 0.0
+        if bond_sum > 0:
+            out.loc[bond_idx, "weight"] = out.loc[bond_idx, "weight"] * (bond_alloc / bond_sum)
+        elif len(bond_idx) > 0:
+            out.loc[bond_idx, "weight"] = bond_alloc / len(bond_idx)
+
+        if len(other_idx) > 0:
+            out.loc[other_idx, "weight"] = 0.0
+
+    return out
 
 
 def _to_plain_dict(item: Any) -> Dict[str, Any]:
@@ -230,6 +303,134 @@ def _get_runtime_state(key: str, default: str = "") -> str:
     return row["value"] if row else default
 
 
+class _LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+def _load_login_settings() -> Dict[str, Any]:
+    required_raw = _get_runtime_state("site2_login_required", "false").strip().lower()
+    return {
+        "required": required_raw in {"1", "true", "yes", "y", "on"},
+        "username": _get_runtime_state("site2_login_id", ""),
+        "password": _get_runtime_state("site2_login_password", ""),
+    }
+
+
+def _purge_expired_tokens() -> None:
+    now = datetime.now(tz=KST)
+    for token, expires_at in list(ACTIVE_TOKENS.items()):
+        if expires_at <= now:
+            ACTIVE_TOKENS.pop(token, None)
+
+
+def _extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return None
+    token = authorization[len(prefix) :].strip()
+    return token or None
+
+
+def _is_token_valid(token: str) -> bool:
+    _purge_expired_tokens()
+    expires_at = ACTIVE_TOKENS.get(token)
+    return bool(expires_at and expires_at > datetime.now(tz=KST))
+
+
+def _require_site2_auth(authorization: str | None = Header(default=None)) -> None:
+    settings = _load_login_settings()
+    if not settings["required"]:
+        return
+    token = _extract_bearer_token(authorization)
+    if not token or not _is_token_valid(token):
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+
+def _parse_holdings_json(holdings_json: str | None) -> List[Dict[str, Any]]:
+    if not holdings_json:
+        return []
+    try:
+        data = json.loads(holdings_json)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+
+    holdings: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        holdings.append(
+            {
+                "code": _normalize_code(row.get("code", "")),
+                "name": str(row.get("name", "")),
+                "qty": _safe_int(row.get("qty", 0)),
+                "current_price": _safe_float(row.get("current_price", 0.0)),
+                "eval_amount": _safe_float(row.get("eval_amount", 0.0)),
+                "weight": _safe_float(row.get("weight", 0.0)),
+            }
+        )
+    holdings.sort(key=lambda x: x["eval_amount"], reverse=True)
+    return holdings
+
+
+def _selected_universe_columns() -> set[str]:
+    with sqlite3.connect(SELECTED_DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cols = {row["name"] for row in con.execute("PRAGMA table_info(selected_universe)").fetchall()}
+    return cols
+
+
+def _load_universe_map() -> Dict[str, Dict[str, Any]]:
+    cols = _selected_universe_columns()
+    days_col = "days" if "days" in cols else "days_in_3y" if "days_in_3y" in cols else None
+    days_sql = days_col if days_col else "NULL"
+    with sqlite3.connect(SELECTED_DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            f"SELECT code, name, sleeve, total_return_3y, {days_sql} AS days FROM selected_universe"
+        ).fetchall()
+    limit_map = {"RISK": 70, "BOND": 100}
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        code = _normalize_code(row["code"])
+        sleeve = str(row["sleeve"] or "").upper()
+        result[code] = {
+            "name": row["name"],
+            "sleeve": sleeve,
+            "allocation_limit_pct": limit_map.get(sleeve, 70),
+            "total_return_3y": _safe_float(row["total_return_3y"], 0.0),
+            "days": _safe_int(row["days"], 0),
+        }
+    return result
+
+
+def _latest_holding_codes() -> set[str]:
+    with _db_connect() as con:
+        rows = con.execute(
+            """
+            SELECT ps.holdings_json
+            FROM portfolio_snapshot ps
+            JOIN (
+                SELECT account, MAX(captured_at) AS max_captured_at
+                FROM portfolio_snapshot
+                GROUP BY account
+            ) latest
+              ON latest.account = ps.account
+             AND latest.max_captured_at = ps.captured_at
+            """
+        ).fetchall()
+    codes: set[str] = set()
+    for row in rows:
+        for item in _parse_holdings_json(row["holdings_json"]):
+            code = _normalize_code(item.get("code", ""))
+            if code:
+                codes.add(code)
+    return codes
+
 def _ensure_strategy_outputs() -> None:
     if not SELECTED_DB_PATH.exists():
         raise FileNotFoundError(f"selected universe DB not found: {SELECTED_DB_PATH}")
@@ -259,7 +460,7 @@ def _load_weights_df() -> pd.DataFrame:
     df["weight"] = df["weight"].astype(float)
     if "sleeve" not in df.columns:
         df["sleeve"] = "UNKNOWN"
-    return df
+    return _apply_sleeve_targets(df)
 
 
 def _load_best_config() -> Dict[str, Any]:
@@ -267,6 +468,89 @@ def _load_best_config() -> Dict[str, Any]:
     if not BEST_CONFIG_PATH.exists():
         return {}
     return json.loads(BEST_CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def _load_strategy_selection_rows_for_day(day: date) -> Tuple[str | None, List[Dict[str, Any]]]:
+    _ensure_strategy_outputs()
+    if not WEIGHTS_CSV_PATH.exists():
+        return None, []
+
+    target_day = day.isoformat()
+    rows: List[Dict[str, Any]] = []
+    date_values: set[str] = set()
+
+    with WEIGHTS_CSV_PATH.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw_date = str(row.get("date") or "").strip()
+            if not raw_date:
+                continue
+            day_str = raw_date[:10]
+            date_values.add(day_str)
+            rows.append(
+                {
+                    "date": day_str,
+                    "code": _normalize_code(row.get("code", "")),
+                    "sleeve": str(row.get("sleeve", "") or "UNKNOWN").upper(),
+                    "weight": _safe_float(row.get("weight", 0.0), 0.0),
+                }
+            )
+
+    if not rows:
+        return None, []
+
+    le_dates = [d for d in date_values if d <= target_day]
+    if le_dates:
+        use_day = max(le_dates)
+    else:
+        use_day = min(date_values)
+
+    selected = [r for r in rows if r["date"] == use_day]
+
+    # Apply live sleeve targets (e.g., 70:25) so dashboard selection matches execution logic.
+    risk_target, bond_target = _get_sleeve_weight_targets()
+    risk_rows = [r for r in selected if r["sleeve"] == "RISK"]
+    bond_rows = [r for r in selected if r["sleeve"] == "BOND"]
+    other_rows = [r for r in selected if r["sleeve"] not in {"RISK", "BOND"}]
+
+    if risk_rows and bond_rows:
+        risk_alloc = risk_target
+        bond_alloc = bond_target
+    elif risk_rows:
+        risk_alloc = 1.0
+        bond_alloc = 0.0
+    elif bond_rows:
+        risk_alloc = 0.0
+        bond_alloc = 1.0
+    else:
+        risk_alloc = 0.0
+        bond_alloc = 0.0
+
+    risk_sum = sum(r["weight"] for r in risk_rows)
+    if risk_rows:
+        if risk_sum > 0:
+            for row in risk_rows:
+                row["weight"] = row["weight"] * (risk_alloc / risk_sum)
+        else:
+            even = risk_alloc / len(risk_rows)
+            for row in risk_rows:
+                row["weight"] = even
+
+    bond_sum = sum(r["weight"] for r in bond_rows)
+    if bond_rows:
+        if bond_sum > 0:
+            for row in bond_rows:
+                row["weight"] = row["weight"] * (bond_alloc / bond_sum)
+        else:
+            even = bond_alloc / len(bond_rows)
+            for row in bond_rows:
+                row["weight"] = even
+
+    for row in other_rows:
+        row["weight"] = 0.0
+
+    selected.sort(key=lambda x: x["weight"], reverse=True)
+    return use_day, selected
 
 
 def _selected_codes() -> List[str]:
@@ -788,6 +1072,94 @@ def _sync_kis_trade_history_sync(days: int = 180) -> Dict[str, Any]:
     return details
 
 
+def _is_buying_power_error(message: str) -> bool:
+    text = str(message or "")
+    lowered = text.lower()
+    kr_keywords = [
+        "주문가능금액",
+        "가능금액을 초과",
+        "주문 가능 금액",
+        "주문가능수량",
+        "가능수량",
+    ]
+    en_keywords = [
+        "insufficient",
+        "buying power",
+        "orderable amount",
+    ]
+    return any(k in text for k in kr_keywords) or any(k in lowered for k in en_keywords)
+
+
+def _buy_qty_candidates(original_qty: int) -> List[int]:
+    if original_qty <= 1:
+        return [max(1, original_qty)]
+    ratios = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1]
+    qtys: List[int] = []
+    for ratio in ratios:
+        qty = max(1, int(math.floor(original_qty * ratio)))
+        if qty not in qtys:
+            qtys.append(qty)
+    return qtys
+
+
+def _submit_order_with_fallback(bot: Any, preview: Dict[str, Any]) -> Dict[str, Any]:
+    side = str(preview.get("side", "")).upper()
+    code = _normalize_code(preview.get("code", ""))
+    original_qty = max(1, int(preview.get("qty", 1)))
+    attempts: List[Dict[str, Any]] = []
+
+    if side != "BUY":
+        try:
+            response = bot.create_order("KRX", code, "market", side.lower(), original_qty)
+            if isinstance(response, dict) and response.get("rt_cd") not in (None, "0"):
+                message = str(response.get("msg1", "order rejected"))
+                return {"status": "ERROR", "message": message, "response": response, "used_qty": original_qty, "attempts": [{"qty": original_qty, "message": message}]}
+            return {"status": "SUCCESS", "message": "order submitted", "response": response if isinstance(response, dict) else {"raw": str(response)}, "used_qty": original_qty, "attempts": [{"qty": original_qty, "message": "ok"}]}
+        except Exception as exc:
+            message = str(exc)
+            return {"status": "ERROR", "message": message, "response": {"error": message}, "used_qty": original_qty, "attempts": [{"qty": original_qty, "message": message}]}
+
+    last_error_message = "order rejected"
+    last_error_response: Dict[str, Any] = {"error": last_error_message}
+    last_qty = original_qty
+
+    for qty in _buy_qty_candidates(original_qty):
+        last_qty = qty
+        try:
+            response = bot.create_order("KRX", code, "market", "buy", qty)
+            if isinstance(response, dict) and response.get("rt_cd") not in (None, "0"):
+                message = str(response.get("msg1", "order rejected"))
+                attempts.append({"qty": qty, "message": message})
+                last_error_message = message
+                last_error_response = response
+                if _is_buying_power_error(message) and qty > 1:
+                    continue
+                return {"status": "ERROR", "message": message, "response": response, "used_qty": qty, "attempts": attempts}
+
+            if qty < original_qty:
+                message = f"order submitted (qty adjusted {original_qty}->{qty})"
+            else:
+                message = "order submitted"
+            attempts.append({"qty": qty, "message": message})
+            return {"status": "SUCCESS", "message": message, "response": response if isinstance(response, dict) else {"raw": str(response)}, "used_qty": qty, "attempts": attempts}
+        except Exception as exc:
+            message = str(exc)
+            attempts.append({"qty": qty, "message": message})
+            last_error_message = message
+            last_error_response = {"error": message}
+            if _is_buying_power_error(message) and qty > 1:
+                continue
+            return {"status": "ERROR", "message": message, "response": {"error": message}, "used_qty": qty, "attempts": attempts}
+
+    return {
+        "status": "ERROR",
+        "message": f"{last_error_message} (qty fallback exhausted)",
+        "response": last_error_response,
+        "used_qty": last_qty,
+        "attempts": attempts,
+    }
+
+
 def _execute_trade_for_account_sync(account: int, reason: str, force: bool = False) -> Dict[str, Any]:
     weights_df = _load_weights_df()
     strategy_date, _, weight_map = _target_weights_for_day(weights_df, _today_kst())
@@ -834,32 +1206,24 @@ def _execute_trade_for_account_sync(account: int, reason: str, force: bool = Fal
             )
             continue
 
-        try:
-            response = bot.create_order(
-                "KRX",
-                preview["code"],
-                "market",
-                preview["side"].lower(),
-                int(preview["qty"]),
-            )
-            status = "SUCCESS"
-            message = "order submitted"
-            if isinstance(response, dict) and response.get("rt_cd") not in (None, "0"):
-                status = "ERROR"
-                message = str(response.get("msg1", "order rejected"))
-                errors += 1
-            else:
-                executed_count += 1
-        except Exception as exc:
-            response = {"error": str(exc)}
-            status = "ERROR"
-            message = str(exc)
+        order_result = _submit_order_with_fallback(bot, preview)
+        status = str(order_result.get("status", "ERROR"))
+        message = str(order_result.get("message", "order rejected"))
+        response = order_result.get("response", {})
+        used_qty = int(order_result.get("used_qty", int(preview["qty"])))
+
+        if status == "SUCCESS":
+            executed_count += 1
+        else:
             errors += 1
+
+        record_preview = dict(preview)
+        record_preview["qty"] = used_qty
 
         _record_trade_history(
             account=account,
             requested_at=requested_at,
-            preview=preview,
+            preview=record_preview,
             status=status,
             message=message,
             response=response if isinstance(response, dict) else {"raw": str(response)},
@@ -915,8 +1279,10 @@ def _is_scheduled_trade_time(now: datetime) -> bool:
         return False
     hour, minute = _get_trade_trigger()
     trigger = time(hour=hour, minute=minute)
+    market_open = time(hour=9, minute=0)
     market_close = time(hour=15, minute=30)
-    return trigger <= now.time() <= market_close
+    window_start = max(trigger, market_open)
+    return window_start <= now.time() <= market_close
 
 
 def _latest_snapshots() -> Dict[int, Dict[str, Any]]:
@@ -1140,301 +1506,23 @@ async def site2_startup() -> None:
 @SITE2_ROUTER.get("", include_in_schema=False)
 @SITE2_ROUTER.get("/", include_in_schema=False)
 async def site2_index() -> HTMLResponse:
+    index_path = SITE2_FRONTEND_DIST_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
     return HTMLResponse(
-        """
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>연금 자동매매 Site2</title>
-  <style>
-    :root {
-      --bg: #f2f5f7;
-      --ink: #102027;
-      --card: #ffffff;
-      --line: #d6dde2;
-      --accent: #0f766e;
-      --accent-2: #0c4a6e;
-      --danger: #b91c1c;
-      --muted: #546e7a;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Pretendard Variable", "Noto Sans KR", "Segoe UI", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(1200px 600px at 100% -10%, #d5f5e6 0%, rgba(213,245,230,0) 55%),
-        radial-gradient(1200px 500px at -10% 0%, #dbeafe 0%, rgba(219,234,254,0) 50%),
-        var(--bg);
-    }
-    .wrap { max-width: 1300px; margin: 0 auto; padding: 18px; }
-    .top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    .title {
-      font-size: 26px;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-    }
-    .meta { color: var(--muted); font-size: 13px; }
-    .btns { display: flex; gap: 8px; }
-    button {
-      border: 0;
-      border-radius: 10px;
-      padding: 10px 14px;
-      color: #fff;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      cursor: pointer;
-      font-weight: 700;
-    }
-    button.warn {
-      background: linear-gradient(135deg, #ef4444, #b91c1c);
-    }
-    .grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px;
-      box-shadow: 0 8px 22px rgba(16, 32, 39, 0.06);
-    }
-    .span-6 { grid-column: span 6; }
-    .span-12 { grid-column: span 12; }
-    .card h3 {
-      margin: 0 0 10px;
-      font-size: 15px;
-      color: var(--accent-2);
-      letter-spacing: 0.1px;
-    }
-    .kpis { display: flex; flex-wrap: wrap; gap: 8px; }
-    .kpi {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 10px;
-      padding: 8px 10px;
-      min-width: 160px;
-    }
-    .kpi .k { font-size: 11px; color: #64748b; }
-    .kpi .v { font-size: 16px; font-weight: 700; margin-top: 2px; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-    }
-    th, td {
-      border-bottom: 1px solid #edf2f7;
-      text-align: left;
-      padding: 6px 4px;
-      vertical-align: top;
-    }
-    th { color: #475569; font-weight: 700; }
-    .small { font-size: 12px; color: #64748b; }
-    .pill {
-      display: inline-block;
-      border-radius: 999px;
-      padding: 3px 8px;
-      font-size: 11px;
-      font-weight: 700;
-      background: #e2e8f0;
-      color: #334155;
-    }
-    .pill.ok { background: #dcfce7; color: #166534; }
-    .pill.err { background: #fee2e2; color: #991b1b; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    @media (max-width: 960px) {
-      .span-6, .span-12 { grid-column: span 12; }
-      .title { font-size: 22px; }
-      .top { flex-direction: column; align-items: flex-start; }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <div>
-        <div class="title">연금 자동매매 Site2</div>
-        <div class="meta" id="meta">데이터 로딩 중...</div>
-      </div>
-      <div class="btns">
-        <button onclick="manualRefresh()">DB/KIS 최신화</button>
-        <button class="warn" onclick="manualTrade()">지금 매매 실행</button>
-      </div>
-    </div>
-
-    <div class="grid">
-      <section class="card span-12">
-        <h3>운영 상태</h3>
-        <div class="kpis" id="kpis"></div>
-      </section>
-
-      <section class="card span-6">
-        <h3>KIS5 계좌 현황</h3>
-        <div id="acct5"></div>
-      </section>
-
-      <section class="card span-6">
-        <h3>KIS8 계좌 현황</h3>
-        <div id="acct8"></div>
-      </section>
-
-      <section class="card span-12">
-        <h3>지난 매매 내역</h3>
-        <div id="trades"></div>
-      </section>
-
-      <section class="card span-12">
-        <h3>앞으로의 매매 계획</h3>
-        <div id="plan"></div>
-      </section>
-
-      <section class="card span-12">
-        <h3>최신화 로그</h3>
-        <div id="logs"></div>
-      </section>
-    </div>
-  </div>
-
-  <script>
-    const fmt = new Intl.NumberFormat('ko-KR');
-    let latestData = null;
-
-    function won(v) { return `${fmt.format(Math.round(v || 0))}원`; }
-    function pct(v) { return `${((v || 0) * 100).toFixed(2)}%`; }
-
-    function badge(status) {
-      const cls = (status === 'SUCCESS' || status === 'SIMULATED') ? 'ok' : (status === 'ERROR' ? 'err' : '');
-      return `<span class="pill ${cls}">${status}</span>`;
-    }
-
-    function accountBox(account) {
-      if (!account || !account.captured_at) {
-        return `<div class="small">스냅샷 데이터 없음</div>`;
-      }
-      const preview = account.order_preview || [];
-      const holdings = account.holdings || [];
-
-      let h = '<div class="kpis">';
-      h += `<div class="kpi"><div class="k">총 평가액</div><div class="v">${won(account.total_krw)}</div></div>`;
-      h += `<div class="kpi"><div class="k">현금 추정</div><div class="v">${won(account.cash_krw)}</div></div>`;
-      h += `<div class="kpi"><div class="k">계획 기준일</div><div class="v mono">${account.plan_date}</div></div>`;
-      h += `<div class="kpi"><div class="k">예상 주문수</div><div class="v">${preview.length}건</div></div>`;
-      h += '</div>';
-
-      h += '<div style="margin-top:10px"><table><thead><tr><th>종목</th><th>수량</th><th>평가액</th><th>비중</th></tr></thead><tbody>';
-      for (const row of holdings.slice(0, 12)) {
-        h += `<tr><td class="mono">${row.code} ${row.name || ''}</td><td>${fmt.format(row.qty)}</td><td>${won(row.eval_amount)}</td><td>${pct(row.weight)}</td></tr>`;
-      }
-      h += '</tbody></table></div>';
-
-      h += '<div style="margin-top:10px"><div class="small">리밸런싱 예정 주문(상위 12건)</div>';
-      h += '<table><thead><tr><th>코드</th><th>구분</th><th>수량</th><th>현재→목표</th><th>목표비중</th></tr></thead><tbody>';
-      for (const row of preview.slice(0, 12)) {
-        h += `<tr><td class="mono">${row.code}</td><td>${row.side}</td><td>${fmt.format(row.qty)}</td><td>${fmt.format(row.current_qty)}→${fmt.format(row.target_qty)}</td><td>${pct(row.target_weight)}</td></tr>`;
-      }
-      h += '</tbody></table></div>';
-      return h;
-    }
-
-    function renderTrades(trades) {
-      let h = '<table><thead><tr><th>ID</th><th>시각</th><th>계좌</th><th>코드</th><th>구분</th><th>수량</th><th>상태</th><th>메시지</th></tr></thead><tbody>';
-      for (const t of (trades || []).slice(0, 80)) {
-        h += `<tr><td>${t.id}</td><td class="mono">${t.requested_at}</td><td>KIS${t.account}</td><td class="mono">${t.code}</td><td>${t.side}</td><td>${fmt.format(t.qty)}</td><td>${badge(t.status)}</td><td>${t.message || ''}</td></tr>`;
-      }
-      h += '</tbody></table>';
-      return h;
-    }
-
-    function renderPlan(plan) {
-      let h = '<table><thead><tr><th>날짜</th><th>구분</th><th>상위 종목</th></tr></thead><tbody>';
-      for (const p of (plan || []).slice(0, 15)) {
-        const head = (p.items || []).slice(0, 8).map(x => `${x.code}(${pct(x.weight)})`).join(', ');
-        h += `<tr><td class="mono">${p.date}</td><td>${p.projected ? 'Projection' : 'From Backtest'}</td><td class="mono">${head}</td></tr>`;
-      }
-      h += '</tbody></table>';
-      return h;
-    }
-
-    function renderLogs(logs) {
-      let h = '<table><thead><tr><th>시각</th><th>레벨</th><th>이벤트</th><th>메시지</th></tr></thead><tbody>';
-      for (const log of (logs || []).slice(0, 80)) {
-        h += `<tr><td class="mono">${log.created_at}</td><td>${log.level}</td><td>${log.event}</td><td>${log.message}</td></tr>`;
-      }
-      h += '</tbody></table>';
-      return h;
-    }
-
-    function renderKpis(data) {
-      const settings = data.settings || {};
-      const quote = data.quote_status || {};
-      const cfg = data.config || {};
-      const s = cfg.best_pair_metrics || {};
-
-      let h = '';
-      h += `<div class="kpi"><div class="k">활성 플랜 기준일</div><div class="v mono">${data.active_plan_date || '-'}</div></div>`;
-      h += `<div class="kpi"><div class="k">실시간 시세 종목수</div><div class="v">${fmt.format(quote.count || 0)}개</div></div>`;
-      h += `<div class="kpi"><div class="k">최근 시세 동기화</div><div class="v mono">${quote.updated_at || '-'}</div></div>`;
-      h += `<div class="kpi"><div class="k">자동매매 스케줄</div><div class="v mono">${settings.trade_trigger?.hour ?? 9}:${String(settings.trade_trigger?.minute ?? 5).padStart(2,'0')}</div></div>`;
-      h += `<div class="kpi"><div class="k">자동매매 활성</div><div class="v">${settings.autotrade_enabled ? 'ON' : 'OFF'}</div></div>`;
-      h += `<div class="kpi"><div class="k">실주문 실행</div><div class="v">${settings.live_order_enabled ? 'ON' : 'DRY-RUN'}</div></div>`;
-      h += `<div class="kpi"><div class="k">백테스트 누적 성과</div><div class="v">x${(s.eq_all || 0).toFixed(3)}</div></div>`;
-      return h;
-    }
-
-    async function loadDashboard() {
-      const res = await fetch('/site2/api/dashboard', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      latestData = data;
-
-      document.getElementById('meta').textContent = `현재시각 ${data.now} | 전략 기준일 ${data.active_plan_date}`;
-      document.getElementById('kpis').innerHTML = renderKpis(data);
-
-      const a5 = (data.accounts || []).find(a => a.account === 5);
-      const a8 = (data.accounts || []).find(a => a.account === 8);
-      document.getElementById('acct5').innerHTML = accountBox(a5);
-      document.getElementById('acct8').innerHTML = accountBox(a8);
-
-      document.getElementById('trades').innerHTML = renderTrades(data.recent_trades);
-      document.getElementById('plan').innerHTML = renderPlan(data.future_plan);
-      document.getElementById('logs').innerHTML = renderLogs(data.refresh_logs);
-    }
-
-    async function manualRefresh() {
-      await fetch('/site2/api/refresh-now', { method: 'POST' });
-      await loadDashboard();
-    }
-
-    async function manualTrade() {
-      await fetch('/site2/api/trade-now', { method: 'POST' });
-      await loadDashboard();
-    }
-
-    async function loop() {
-      try {
-        await loadDashboard();
-      } catch (err) {
-        document.getElementById('meta').textContent = `로딩 실패: ${err.message}`;
-      } finally {
-        setTimeout(loop, 20000);
-      }
-    }
-
-    loop();
-  </script>
-</body>
-</html>
-        """.strip()
+        "<h3>site2 프론트엔드 빌드가 없습니다.</h3>"
+        "<p><code>cd /home/ubuntu/연금계좌자동매매/site2/frontend && npm install && npm run build</code></p>",
+        status_code=503,
     )
+
+
+@SITE2_ROUTER.get("/assets/{asset_path:path}", include_in_schema=False)
+async def site2_assets(asset_path: str) -> FileResponse:
+    asset_file = (SITE2_FRONTEND_ASSETS_DIR / asset_path).resolve()
+    assets_root = SITE2_FRONTEND_ASSETS_DIR.resolve()
+    if not str(asset_file).startswith(str(assets_root)) or not asset_file.exists() or not asset_file.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    return FileResponse(asset_file)
 
 
 @SITE2_ROUTER.get("/api/dashboard", response_class=ORJSONResponse)
@@ -1470,5 +1558,498 @@ async def site2_health() -> ORJSONResponse:
                 "minute": _get_trade_trigger()[1],
             },
             "accounts": TARGET_ACCOUNTS,
+        }
+    )
+
+
+@SITE2_ROUTER.get("/api/auth/status", response_class=ORJSONResponse)
+@SITE2_ROUTER.get("/api/api/auth/status", response_class=ORJSONResponse)
+async def site2_auth_status(authorization: str | None = Header(default=None)) -> ORJSONResponse:
+    settings = _load_login_settings()
+    if not settings["required"]:
+        return ORJSONResponse({"login_required": False, "authenticated": True})
+    token = _extract_bearer_token(authorization)
+    return ORJSONResponse(
+        {
+            "login_required": True,
+            "authenticated": bool(token and _is_token_valid(token)),
+        }
+    )
+
+
+@SITE2_ROUTER.post("/api/auth/login", response_class=ORJSONResponse)
+@SITE2_ROUTER.post("/api/api/auth/login", response_class=ORJSONResponse)
+async def site2_auth_login(payload: _LoginPayload) -> ORJSONResponse:
+    settings = _load_login_settings()
+    if not settings["required"]:
+        return ORJSONResponse(
+            {"login_required": False, "token": "", "expires_at": None, "username": ""}
+        )
+
+    if payload.username != settings["username"] or payload.password != settings["password"]:
+        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(tz=KST) + timedelta(hours=SESSION_TTL_HOURS)
+    ACTIVE_TOKENS[token] = expires_at
+    return ORJSONResponse(
+        {
+            "login_required": True,
+            "token": token,
+            "expires_at": expires_at.isoformat(),
+            "username": settings["username"],
+        }
+    )
+
+
+@SITE2_ROUTER.post("/api/auth/logout", response_class=ORJSONResponse)
+@SITE2_ROUTER.post("/api/api/auth/logout", response_class=ORJSONResponse)
+async def site2_auth_logout(authorization: str | None = Header(default=None)) -> ORJSONResponse:
+    token = _extract_bearer_token(authorization)
+    if token:
+        ACTIVE_TOKENS.pop(token, None)
+    return ORJSONResponse({"ok": True})
+
+
+@SITE2_ROUTER.get("/api/summary", response_class=ORJSONResponse)
+@SITE2_ROUTER.get("/api/api/summary", response_class=ORJSONResponse)
+async def site2_summary(_: None = Depends(_require_site2_auth)) -> ORJSONResponse:
+    _init_site2_db()
+    _ensure_strategy_outputs()
+
+    with _db_connect() as con:
+        account_rows = con.execute(
+            """
+            SELECT ps.account, ps.captured_at, ps.total_krw, ps.cash_krw, ps.holdings_json
+            FROM portfolio_snapshot ps
+            JOIN (
+                SELECT account, MAX(captured_at) AS max_captured_at
+                FROM portfolio_snapshot
+                GROUP BY account
+            ) latest
+              ON latest.account = ps.account
+             AND latest.max_captured_at = ps.captured_at
+            ORDER BY ps.account
+            """
+        ).fetchall()
+
+        accounts: List[Dict[str, Any]] = []
+        for row in account_rows:
+            holdings = _parse_holdings_json(row["holdings_json"])
+            total_krw = _safe_float(row["total_krw"], 0.0)
+            cash_krw = _safe_float(row["cash_krw"], 0.0)
+            accounts.append(
+                {
+                    "account": _safe_int(row["account"]),
+                    "captured_at": row["captured_at"],
+                    "total_krw": total_krw,
+                    "cash_krw": cash_krw,
+                    "invested_krw": max(0.0, total_krw - cash_krw),
+                    "holding_count": len(holdings),
+                }
+            )
+
+        trade_status_counts = {
+            str(r["status"]): _safe_int(r["cnt"])
+            for r in con.execute("SELECT status, COUNT(*) AS cnt FROM trade_history GROUP BY status").fetchall()
+        }
+
+        recent_trades = [
+            {
+                "requested_at": r["requested_at"],
+                "account": _safe_int(r["account"]),
+                "code": _normalize_code(r["code"]),
+                "side": r["side"],
+                "qty": _safe_int(r["qty"]),
+                "price": _safe_float(r["price"], 0.0),
+                "status": r["status"],
+                "message": r["message"] or "",
+            }
+            for r in con.execute(
+                """
+                SELECT requested_at, account, code, side, qty, price, status, message
+                FROM trade_history
+                ORDER BY id DESC
+                LIMIT 20
+                """
+            ).fetchall()
+        ]
+
+        error_trades_raw = [
+            {
+                "requested_at": r["requested_at"],
+                "account": _safe_int(r["account"]),
+                "code": _normalize_code(r["code"]),
+                "side": str(r["side"] or ""),
+                "qty": _safe_int(r["qty"]),
+                "price": _safe_float(r["price"], 0.0),
+                "status": r["status"],
+                "message": r["message"] or "",
+            }
+            for r in con.execute(
+                """
+                SELECT requested_at, account, code, side, qty, price, status, message
+                FROM trade_history
+                WHERE status = 'ERROR'
+                ORDER BY id DESC
+                LIMIT 120
+                """
+            ).fetchall()
+        ]
+
+        refresh_events = [
+            {
+                "created_at": r["created_at"],
+                "level": r["level"],
+                "event": r["event"],
+                "message": r["message"],
+            }
+            for r in con.execute(
+                """
+                SELECT created_at, level, event, message
+                FROM refresh_log
+                ORDER BY id DESC
+                LIMIT 12
+                """
+            ).fetchall()
+        ]
+
+    with sqlite3.connect(SELECTED_DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cnt_rows = con.execute(
+            "SELECT sleeve, COUNT(*) AS cnt FROM selected_universe GROUP BY sleeve"
+        ).fetchall()
+        counts = {str(r["sleeve"]).upper(): _safe_int(r["cnt"]) for r in cnt_rows}
+        meta_row = con.execute("SELECT * FROM universe_metadata LIMIT 1").fetchone()
+        universe_meta = dict(meta_row) if meta_row else {}
+        universe_rows = con.execute(
+            "SELECT code, name, sleeve FROM selected_universe"
+        ).fetchall()
+
+    universe_map = {
+        _normalize_code(r["code"]): {
+            "name": str(r["name"] or ""),
+            "sleeve": str(r["sleeve"] or "").upper(),
+        }
+        for r in universe_rows
+    }
+
+    strategy_selection = {"plan_date": None, "items": []}
+    try:
+        plan_date, plan_items = _load_strategy_selection_rows_for_day(_today_kst())
+        enriched_items = []
+        for item in plan_items:
+            code = _normalize_code(item.get("code", ""))
+            sleeve = str(item.get("sleeve", "") or "").upper()
+            meta = universe_map.get(code, {})
+            enriched_items.append(
+                {
+                    "code": code,
+                    "name": meta.get("name", ""),
+                    "sleeve": sleeve,
+                    "weight": _safe_float(item.get("weight", 0.0), 0.0),
+                    "allocation_limit_pct": 100 if sleeve == "BOND" else 70,
+                }
+            )
+        strategy_selection = {
+            "plan_date": plan_date,
+            "items": sorted(enriched_items, key=lambda x: x["weight"], reverse=True),
+        }
+    except Exception:
+        strategy_selection = {"plan_date": None, "items": []}
+
+    error_trades = []
+    for row in error_trades_raw:
+        meta = universe_map.get(row["code"], {})
+        item = {
+            **row,
+            "name": meta.get("name", ""),
+            "sleeve": meta.get("sleeve", "UNKNOWN"),
+        }
+        error_trades.append(item)
+
+    bond_buy_failures = [
+        row
+        for row in error_trades
+        if row.get("side") == "BUY" and row.get("sleeve") == "BOND"
+    ]
+
+    bond_buy_failure_reason_counts: Dict[str, int] = {}
+    for row in bond_buy_failures:
+        reason = (row.get("message") or "").strip() or "사유 미상"
+        bond_buy_failure_reason_counts[reason] = bond_buy_failure_reason_counts.get(reason, 0) + 1
+
+    bond_buy_failure_summary = sorted(
+        [{"reason": k, "count": v} for k, v in bond_buy_failure_reason_counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+
+    total_krw_sum = sum(row["total_krw"] for row in accounts)
+    cash_krw_sum = sum(row["cash_krw"] for row in accounts)
+    risk_target, bond_target = _get_sleeve_weight_targets()
+
+    return ORJSONResponse(
+        {
+            "generated_at": _iso_now(),
+            "accounts": accounts,
+            "portfolio_totals": {
+                "total_krw": total_krw_sum,
+                "cash_krw": cash_krw_sum,
+                "invested_krw": max(0.0, total_krw_sum - cash_krw_sum),
+            },
+            "etf_counts": {
+                "limit_70_count": counts.get("RISK", 0),
+                "limit_100_count": counts.get("BOND", 0),
+                "total_count": counts.get("RISK", 0) + counts.get("BOND", 0),
+            },
+            "sleeve_targets": {
+                "risk_weight": risk_target,
+                "bond_weight": bond_target,
+                "cash_buffer_weight": max(0.0, 1.0 - (risk_target + bond_target)),
+            },
+            "trade_status_counts": trade_status_counts,
+            "recent_trades": recent_trades,
+            "error_trades": error_trades,
+            "bond_buy_failures": bond_buy_failures,
+            "bond_buy_failure_summary": bond_buy_failure_summary,
+            "strategy_selection": strategy_selection,
+            "refresh_events": refresh_events,
+            "universe_meta": universe_meta,
+        }
+    )
+
+
+@SITE2_ROUTER.get("/api/portfolio/history", response_class=ORJSONResponse)
+@SITE2_ROUTER.get("/api/api/portfolio/history", response_class=ORJSONResponse)
+async def site2_portfolio_history(
+    account: int = Query(..., description="계좌번호"),
+    limit: int = Query(240, ge=30, le=2000),
+    _: None = Depends(_require_site2_auth),
+) -> ORJSONResponse:
+    with _db_connect() as con:
+        rows = con.execute(
+            """
+            SELECT captured_at, total_krw, cash_krw, holdings_json
+            FROM portfolio_snapshot
+            WHERE account = ?
+            ORDER BY captured_at DESC
+            LIMIT ?
+            """,
+            (account, limit),
+        ).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"계좌 {account} 데이터가 없습니다.")
+
+    history = []
+    for row in reversed(rows):
+        total_krw = _safe_float(row["total_krw"], 0.0)
+        cash_krw = _safe_float(row["cash_krw"], 0.0)
+        history.append(
+            {
+                "captured_at": row["captured_at"],
+                "total_krw": total_krw,
+                "cash_krw": cash_krw,
+                "invested_krw": max(0.0, total_krw - cash_krw),
+                "holding_count": len(_parse_holdings_json(row["holdings_json"])),
+            }
+        )
+    return ORJSONResponse({"account": account, "history": history})
+
+
+@SITE2_ROUTER.get("/api/portfolio/latest", response_class=ORJSONResponse)
+@SITE2_ROUTER.get("/api/api/portfolio/latest", response_class=ORJSONResponse)
+async def site2_portfolio_latest(
+    account: int = Query(..., description="계좌번호"),
+    _: None = Depends(_require_site2_auth),
+) -> ORJSONResponse:
+    with _db_connect() as con:
+        row = con.execute(
+            """
+            SELECT captured_at, total_krw, cash_krw, holdings_json
+            FROM portfolio_snapshot
+            WHERE account = ?
+            ORDER BY captured_at DESC
+            LIMIT 1
+            """,
+            (account,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"계좌 {account} 데이터가 없습니다.")
+
+    universe_map = _load_universe_map()
+    holdings = _parse_holdings_json(row["holdings_json"])
+    for item in holdings:
+        uni = universe_map.get(_normalize_code(item["code"]))
+        if uni:
+            item["sleeve"] = uni["sleeve"]
+            item["allocation_limit_pct"] = uni["allocation_limit_pct"]
+            item["total_return_3y"] = uni["total_return_3y"]
+        else:
+            item["sleeve"] = "UNKNOWN"
+            item["allocation_limit_pct"] = 70
+            item["total_return_3y"] = None
+
+    total_krw = _safe_float(row["total_krw"], 0.0)
+    cash_krw = _safe_float(row["cash_krw"], 0.0)
+
+    return ORJSONResponse(
+        {
+            "account": account,
+            "captured_at": row["captured_at"],
+            "total_krw": total_krw,
+            "cash_krw": cash_krw,
+            "invested_krw": max(0.0, total_krw - cash_krw),
+            "holdings": holdings,
+        }
+    )
+
+
+@SITE2_ROUTER.get("/api/etf/categories", response_class=ORJSONResponse)
+@SITE2_ROUTER.get("/api/api/etf/categories", response_class=ORJSONResponse)
+async def site2_etf_categories(
+    search: str = Query("", max_length=60),
+    _: None = Depends(_require_site2_auth),
+) -> ORJSONResponse:
+    cols = _selected_universe_columns()
+    days_col = "days" if "days" in cols else "days_in_3y" if "days_in_3y" in cols else None
+    first_date_col = "first_date" if "first_date" in cols else None
+    last_date_col = "last_date" if "last_date" in cols else None
+
+    days_sql = days_col if days_col else "NULL"
+    first_sql = first_date_col if first_date_col else "NULL"
+    last_sql = last_date_col if last_date_col else "NULL"
+
+    with sqlite3.connect(SELECTED_DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        max_trade_row = con.execute("SELECT MAX(trade_date) AS d FROM etf_daily_close").fetchone()
+        max_trade_date = max_trade_row["d"] if max_trade_row else None
+
+        query = f"""
+            SELECT
+                su.code,
+                su.name,
+                su.sleeve,
+                su.total_return_3y,
+                {days_sql} AS days,
+                {first_sql} AS first_date,
+                {last_sql} AS last_date,
+                dc.close_price AS latest_close
+            FROM selected_universe su
+            LEFT JOIN etf_daily_close dc
+              ON dc.code = su.code
+             AND dc.trade_date = ?
+        """
+        params: List[Any] = [max_trade_date]
+        if search.strip():
+            keyword = f"%{search.strip()}%"
+            query += " WHERE su.code LIKE ? OR su.name LIKE ?"
+            params.extend([keyword, keyword])
+        query += " ORDER BY su.sleeve, su.total_return_3y DESC"
+        rows = con.execute(query, params).fetchall()
+
+    held_codes = _latest_holding_codes()
+
+    def _fmt_trade_date(v: Any) -> str | None:
+        s = str(v or "").strip()
+        if len(s) == 8 and s.isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        return s or None
+
+    limit_map = {"RISK": 70, "BOND": 100}
+    limit_70: List[Dict[str, Any]] = []
+    limit_100: List[Dict[str, Any]] = []
+    for row in rows:
+        sleeve = str(row["sleeve"] or "").upper()
+        limit_pct = limit_map.get(sleeve, 70)
+        item = {
+            "code": _normalize_code(row["code"]),
+            "name": row["name"],
+            "sleeve": sleeve,
+            "allocation_limit_pct": limit_pct,
+            "total_return_3y": _safe_float(row["total_return_3y"], 0.0),
+            "days": _safe_int(row["days"], 0),
+            "first_date": _fmt_trade_date(row["first_date"]),
+            "last_date": _fmt_trade_date(row["last_date"]),
+            "latest_close": _safe_float(row["latest_close"], 0.0),
+            "currently_held": _normalize_code(row["code"]) in held_codes,
+        }
+        if limit_pct == 100:
+            limit_100.append(item)
+        else:
+            limit_70.append(item)
+
+    return ORJSONResponse(
+        {
+            "as_of_trade_date": _fmt_trade_date(max_trade_date),
+            "search": search.strip(),
+            "limit_70": limit_70,
+            "limit_100": limit_100,
+            "counts": {
+                "limit_70_count": len(limit_70),
+                "limit_100_count": len(limit_100),
+                "total_count": len(limit_70) + len(limit_100),
+            },
+        }
+    )
+
+
+@SITE2_ROUTER.get("/api/etf/price-series", response_class=ORJSONResponse)
+@SITE2_ROUTER.get("/api/api/etf/price-series", response_class=ORJSONResponse)
+async def site2_etf_price_series(
+    code: str = Query(..., min_length=4, max_length=8),
+    days: int = Query(360, ge=60, le=3000),
+    _: None = Depends(_require_site2_auth),
+) -> ORJSONResponse:
+    target_code = _normalize_code(code)
+    with sqlite3.connect(SELECTED_DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        name_row = con.execute(
+            "SELECT name FROM etf_master WHERE code = ?",
+            (target_code,),
+        ).fetchone()
+        if not name_row:
+            raise HTTPException(status_code=404, detail=f"ETF code {target_code}을(를) 찾을 수 없습니다.")
+
+        rows = con.execute(
+            """
+            SELECT trade_date, close_price
+            FROM etf_daily_close
+            WHERE code = ?
+            ORDER BY trade_date DESC
+            LIMIT ?
+            """,
+            (target_code, days),
+        ).fetchall()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"ETF code {target_code} 가격 데이터가 없습니다.")
+
+    ordered = list(reversed(rows))
+    first_price = _safe_float(ordered[0]["close_price"], 0.0)
+    series = []
+    for row in ordered:
+        close_price = _safe_float(row["close_price"], 0.0)
+        raw_date = str(row["trade_date"])
+        trade_date = (
+            f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+            if len(raw_date) == 8 and raw_date.isdigit()
+            else raw_date
+        )
+        change_pct = (close_price / first_price - 1.0) if first_price > 0 else 0.0
+        series.append(
+            {
+                "trade_date": trade_date,
+                "close_price": close_price,
+                "change_pct": change_pct,
+            }
+        )
+
+    return ORJSONResponse(
+        {
+            "code": target_code,
+            "name": name_row["name"],
+            "days": days,
+            "series": series,
         }
     )

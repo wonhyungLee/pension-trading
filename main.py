@@ -135,6 +135,15 @@ async def whitelist_middleware(request: Request, call_next):
             ):
                 return await call_next(request)
 
+        # Allow site2 authentication endpoints for public access.
+        # site2 data APIs remain protected by token auth in site2_service.
+        if request.method in ("POST", "OPTIONS"):
+            if (
+                path.startswith("/site2/api/auth/")
+                or path.startswith("/site2/api/api/auth/")
+            ):
+                return await call_next(request)
+
         if (
             request.client.host not in whitelist
             and not ipaddress.ip_address(request.client.host).is_private
